@@ -25,11 +25,11 @@ from pathlib import Path
 from typing import Optional
 
 import streamlit as st
-from dotenv import load_dotenv
+# from dotenv import load_dotenv
 
 from retrieval import retrieve
 
-load_dotenv()
+# load_dotenv()
 
 # ─── Lazy imports so missing packages show friendly errors ────────────────────
 def _require(pkg: str):
