@@ -1,0 +1,211 @@
+"""
+embed_and_index_chunks.py
+-------------------------
+Embeds chunks from chunker.py v6 and uploads them to Azure AI Search.
+
+Supports the full schema including:
+- region
+- energy_utility_name
+- topic/subtopic
+- section
+- metadata
+"""
+
+import os
+import json
+import time
+import random
+from pathlib import Path
+from dotenv import load_dotenv
+
+from openai import AzureOpenAI
+from azure.core.credentials import AzureKeyCredential
+from azure.search.documents import SearchClient
+
+# ─────────────────────────────────────────────
+# Load env
+# ─────────────────────────────────────────────
+
+load_dotenv()
+
+AZURE_OPENAI_ENDPOINT = os.environ["AZURE_OPENAI_ENDPOINT"]
+AZURE_OPENAI_KEY = os.environ["AZURE_OPENAI_API_KEY"]
+AZURE_OPENAI_EMBED_DEPLOY = os.environ["AZURE_OPENAI_EMBED_DEPLOY"]
+
+AZURE_SEARCH_ENDPOINT = os.environ["AZURE_SEARCH_ENDPOINT"]
+AZURE_SEARCH_KEY = os.environ["AZURE_SEARCH_ADMIN_KEY"]
+SEARCH_INDEX_NAME = os.environ.get("SEARCH_INDEX_NAME", "edi-documents")
+
+# batching
+EMBED_BATCH_SIZE = 100
+UPLOAD_BATCH_SIZE = 100
+MAX_RETRIES = 6
+
+
+# ─────────────────────────────────────────────
+# Azure clients
+# ─────────────────────────────────────────────
+
+aoai_client = AzureOpenAI(
+    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+    api_key=AZURE_OPENAI_KEY,
+    api_version="2024-08-01-preview",
+)
+
+search_client = SearchClient(
+    endpoint=AZURE_SEARCH_ENDPOINT,
+    index_name=SEARCH_INDEX_NAME,
+    credential=AzureKeyCredential(AZURE_SEARCH_KEY),
+)
+
+
+# ─────────────────────────────────────────────
+# Retry wrapper
+# ─────────────────────────────────────────────
+
+def retry(func):
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            return func()
+
+        except Exception as e:
+
+            if "429" in str(e):
+
+                wait = (2 ** attempt) + random.random()
+
+                print(
+                    f"⚠️ Rate limited — retrying in {wait:.1f}s "
+                    f"(attempt {attempt+1})"
+                )
+
+                time.sleep(wait)
+
+            else:
+                raise
+
+    raise RuntimeError("Max retries exceeded")
+
+
+# ─────────────────────────────────────────────
+# Load chunks
+# ─────────────────────────────────────────────
+
+def load_chunks(path):
+
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+# ─────────────────────────────────────────────
+# Embedding generation
+# ─────────────────────────────────────────────
+
+def embed_texts(texts):
+
+    def call():
+        return aoai_client.embeddings.create(
+            model=AZURE_OPENAI_EMBED_DEPLOY,
+            input=texts,
+        )
+
+    response = retry(call)
+
+    return [d.embedding for d in response.data]
+
+
+# ─────────────────────────────────────────────
+# Upload to Azure Search
+# ─────────────────────────────────────────────
+
+def upload_documents(docs):
+
+    def call():
+        return search_client.upload_documents(docs)
+
+    retry(call)
+
+
+# ─────────────────────────────────────────────
+# Convert chunk → search document
+# ─────────────────────────────────────────────
+
+def build_document(chunk, embedding):
+
+    doc = dict(chunk)
+
+    doc["content_vector"] = embedding
+
+    return doc
+
+
+# ─────────────────────────────────────────────
+# Main indexing pipeline
+# ─────────────────────────────────────────────
+
+def index_chunks(chunk_file):
+
+    chunks = load_chunks(chunk_file)
+
+    print(f"Loaded {len(chunks)} chunks")
+
+    texts = [c["content"] for c in chunks]
+
+    embeddings = []
+
+    print("Generating embeddings...")
+
+    for i in range(0, len(texts), EMBED_BATCH_SIZE):
+
+        batch = texts[i:i + EMBED_BATCH_SIZE]
+
+        batch_embeddings = embed_texts(batch)
+
+        embeddings.extend(batch_embeddings)
+
+        print(
+            f"Embedded {min(i+EMBED_BATCH_SIZE,len(texts))} "
+            f"/ {len(texts)}"
+        )
+
+    print("Preparing Azure Search documents...")
+
+    docs = []
+
+    for chunk, emb in zip(chunks, embeddings):
+
+        doc = build_document(chunk, emb)
+
+        docs.append(doc)
+
+    print("Uploading to Azure AI Search...")
+
+    for i in range(0, len(docs), UPLOAD_BATCH_SIZE):
+
+        batch = docs[i:i + UPLOAD_BATCH_SIZE]
+
+        upload_documents(batch)
+
+        print(
+            f"Uploaded {min(i+UPLOAD_BATCH_SIZE,len(docs))} "
+            f"/ {len(docs)}"
+        )
+
+    print("✅ Indexing completed")
+
+
+# ─────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────
+
+if __name__ == "__main__":
+
+    chunk_file = Path("chunks.json")
+
+    if not chunk_file.exists():
+        raise FileNotFoundError(
+            "chunks.json not found — run chunker first"
+        )
+
+    index_chunks(chunk_file)
