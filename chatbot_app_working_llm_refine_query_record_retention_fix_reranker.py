@@ -25,11 +25,11 @@ from pathlib import Path
 from typing import Optional
 
 import streamlit as st
-# from dotenv import load_dotenv
+from dotenv import load_dotenv
 
-# from retrieval import retrieve
+from retrieval import retrieve
 
-# load_dotenv()
+load_dotenv()
 
 # ─── Lazy imports so missing packages show friendly errors ────────────────────
 def _require(pkg: str):
@@ -44,7 +44,7 @@ def _require(pkg: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="EDI Chatbot",
+    page_title="Utility Chatbot",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -108,6 +108,19 @@ st.markdown("""
 .badge-text   { background: #1a3a2a; color: #60d48a; }
 .badge-list   { background: #3a2a1a; color: #ffaa60; }
 
+/* ── Refined query banner ── */
+.refined-query-banner {
+    background: #1a2535;
+    border: 1px solid #2e4a6e;
+    border-left: 3px solid #4f8ef7;
+    border-radius: 6px;
+    padding: 7px 12px;
+    margin-bottom: 10px;
+    font-size: 0.80rem;
+    color: #8eb4e0;
+}
+.refined-query-banner strong { color: #4f8ef7; }
+
 /* ── Metric cards ── */
 .metric-card {
     background: #1a1f2e;
@@ -121,6 +134,32 @@ st.markdown("""
 
 /* ── Input area ── */
 .stChatInput > div { background: #1a1f2e !important; border-color: #2a2f3e !important; }
+
+/* ── Regulatory disclaimer ── */
+.regulatory-disclaimer {
+    background: #1a2a1a;
+    border: 1px solid #2e5a2e;
+    border-left: 4px solid #f0ad4e;
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin-bottom: 12px;
+    font-size: 0.82rem;
+    color: #d4c89a;
+}
+.regulatory-disclaimer strong { color: #f0ad4e; }
+
+/* ── Promo / contact banner ── */
+.promo-banner {
+    background: #1a2535;
+    border: 1px solid #2e4a6e;
+    border-left: 4px solid #4fc3f7;
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin-top: 14px;
+    font-size: 0.84rem;
+    color: #b0d4f1;
+}
+.promo-banner strong { color: #4fc3f7; }
 
 /* ── Headings ── */
 h1, h2, h3 { color: #e2e8f0 !important; }
@@ -156,8 +195,93 @@ def get_clients():
         api_version="2024-02-01",
     )
     embed_deploy = os.environ.get("AZURE_OPENAI_EMBED_DEPLOY", "text-embedding-3-small")
-    chat_deploy  = "gpt-4o-mini" # os.environ.get("AZURE_OPENAI_CHAT_DEPLOY",  "gpt-4o-mini")
+    chat_deploy  = "gpt-4o-mini"
     return search_client, openai_client, embed_deploy, chat_deploy
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Query Refinement
+# ─────────────────────────────────────────────────────────────────────────────
+
+QUERY_REFINEMENT_PROMPT = """
+You are a query classifier for a New York retail energy regulatory document system.
+
+Given a user question, extract structured metadata to help route the search correctly.
+
+Your index contains two types of documents:
+1. CROSS-UTILITY documents: Apply to ALL utilities statewide.
+   Examples: NY ESCO Doc (ESCO eligibility, UBP rules, retail access, record retention, 
+   EDI standards, cramming/slamming rules, January 31 statements, officer certification)
+   
+2. UTILITY-SPECIFIC documents: Rules for ONE utility.
+   Examples: Central Hudson tariff, Con Edison procedures, National Grid operating rules,
+   NYSEG, PSEG Long Island, Orange & Rockland, Rochester Gas & Electric, National Fuel Gas
+
+Return a JSON object with these fields:
+{
+  "detected_utility": string or null,       // exact utility name if mentioned, else null
+  "detected_topic": string or null,         // short topic description, else null  
+  "document_scope": "cross_utility" | "utility_specific" | "both" | "unknown",
+  "multiple_utilities": boolean,            // true if question compares 2+ utilities
+  "is_procedural": boolean,                 // true if asking about a process/steps
+  "standalone_query": string,               // rewritten self-contained search query
+  "reasoning": string                       // one sentence why you chose this scope
+}
+
+Rules:
+- If question asks about ESCO eligibility, record retention, UBP rules, EDI standards, 
+  cramming, slamming, or January 31 filings → document_scope = "cross_utility"
+- If question explicitly names a utility → document_scope = "utility_specific"
+- If question asks to compare utilities → multiple_utilities = true, document_scope = "both"
+- If utility is unclear → document_scope = "unknown" (do NOT guess)
+- standalone_query: rewrite the question as if it has no prior conversation context.
+  Incorporate any utility/topic context from the conversation history provided.
+"""
+
+
+def refine_query(
+    question: str,
+    history: list[dict],
+    openai_client,
+    chat_deploy: str,
+) -> str:
+    """
+    Send the raw user question + recent conversation history to the LLM
+    and get back a single optimised search query string.
+    Falls back to the original question if anything goes wrong.
+    """
+    history_text = ""
+    if history:
+        recent = history[-4:]
+        history_text = "\n".join(
+            f"{t['role'].upper()}: {t['content'][:200]}" for t in recent
+        )
+        history_text = f"\n\nRecent conversation:\n{history_text}"
+
+    messages = [
+        {"role": "system", "content": QUERY_REFINEMENT_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"User question: {question}"
+                f"{history_text}\n\n"
+                "Output only the refined search query string:"
+            ),
+        },
+    ]
+
+    try:
+        response = openai_client.chat.completions.create(
+            model=chat_deploy,
+            messages=messages,
+            temperature=0.0,
+            max_tokens=120,
+        )
+        refined = response.choices[0].message.content.strip()
+        refined = refined.strip('"\'')
+        return refined if refined else question
+    except Exception:
+        return question
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -174,7 +298,7 @@ def hybrid_search(
     search_client,
     openai_client,
     embed_deploy: str,
-    top_k: int = 5,
+    top_k: int = 15,
     filter_content_type: Optional[str] = None,
     filter_source: Optional[str] = None,
 ) -> list[dict]:
@@ -187,12 +311,10 @@ def hybrid_search(
         fields="content_vector",
     )
 
-    # Build OData filter
     filters = []
     if filter_content_type and filter_content_type != "All":
         filters.append(f"content_type eq '{filter_content_type.lower()}'")
     if filter_source and filter_source != "All":
-        # filter on source_pdf_name
         safe = filter_source.replace("'", "''")
         filters.append(f"source_pdf_name eq '{safe}'")
     odata_filter = " and ".join(filters) if filters else None
@@ -201,11 +323,11 @@ def hybrid_search(
         search_text=query,
         vector_queries=[vq],
         search_fields=[
-        "section_title",
-        "topic",
-        "subtopic",
-        "content"
-    ],
+            "section_title",
+            "topic",
+            "subtopic",
+            "content"
+        ],
         query_type="semantic",
         semantic_configuration_name="semantic-config",
         query_caption="extractive",
@@ -224,7 +346,6 @@ def hybrid_search(
     hits = []
     for r in results:
         d = dict(r)
-        # Attach semantic captions if available
         captions = r.get("@search.captions", [])
         if captions:
             d["_caption"] = captions[0].text
@@ -235,87 +356,91 @@ def hybrid_search(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Cross-Encoder Reranker
+# ─────────────────────────────────────────────────────────────────────────────
+
+def rerank_hits(
+    query: str,
+    hits: list[dict],
+    openai_client,
+    chat_deploy: str,
+    top_n: int = 8,
+) -> list[dict]:
+    """
+    Use GPT as a cross-encoder to score each chunk's relevance to the query.
+    Scores each chunk 0.0–1.0, sorts descending, returns top_n.
+    Falls back to original Azure-ranked order if anything fails.
+
+    Key benefit: scores relevance of chunk content against the EXACT user
+    question — so "TPV retention 2 years" beats "billing history GAAP 6 years"
+    when the query is about ESCO record retention obligations.
+    """
+    if not hits:
+        return hits
+
+    chunks_text = ""
+    for i, h in enumerate(hits):
+        content_preview = h.get("content", "")[:400]
+        source = h.get("source_pdf_name", "unknown")
+        chunks_text += f"\n[CHUNK {i}] Source: {source}\n{content_preview}\n"
+
+    prompt = f"""You are a relevance scorer for a New York retail energy regulatory document retrieval system.
+
+Query: {query}
+
+Rate each chunk's relevance to the query on a scale of 0.0 to 1.0.
+  1.0 = chunk directly and completely answers the query
+  0.5 = chunk is related but only partially answers
+  0.0 = chunk is unrelated to the query
+
+Important scoring guidance:
+- For questions about ESCO obligations, UBP rules, TPV, record retention, enrollment, 
+  cramming/slamming → prefer chunks from "NY ESCO Doc" over utility-specific tariffs.
+- Utility-specific billing history or GAAP retention schedules are NOT relevant to 
+  general ESCO record retention questions unless a specific utility is named.
+- Prefer chunks that contain the actual rule or requirement, not just a passing mention.
+
+Chunks:
+{chunks_text}
+
+Respond ONLY with a JSON array of float scores, one per chunk, in order.
+Example for 4 chunks: [0.9, 0.2, 0.7, 0.1]
+Output nothing else — no explanation, no markdown."""
+
+    try:
+        response = openai_client.chat.completions.create(
+            model=chat_deploy,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=200,
+        )
+        raw = response.choices[0].message.content.strip()
+        # Strip markdown fences if model wraps in ```json ... ```
+        raw = re.sub(r"```[a-z]*", "", raw).strip().strip("`")
+        scores = json.loads(raw)
+
+        if isinstance(scores, list) and len(scores) == len(hits):
+            for i, h in enumerate(hits):
+                h["_rerank_score"] = float(scores[i])
+            reranked = sorted(hits, key=lambda x: x.get("_rerank_score", 0.0), reverse=True)
+            return reranked[:top_n]
+
+    except Exception:
+        # Silent fallback — original Azure order, trimmed to top_n
+        pass
+
+    return hits[:top_n]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # GPT-4 RAG
 # ─────────────────────────────────────────────────────────────────────────────
 
-# SYSTEM_PROMPT = """You are a Retail Energy Regulatory and Market Rules Assistant.
-# Your purpose is to provide accurate, market-specific, and utility-specific regulatory guidance for retail energy operations in U.S. deregulated electricity and gas markets.
-# Legal Disclaimer Requirement
-# In your first response of every new conversation, you must include the following disclaimer:
-# Regulatory Disclaimer: The information provided is for general regulatory guidance purposes only and should not be relied upon as legal advice. All regulatory, tariff, and market rule interpretations should be independently corroborated with the relevant Public Utility Commission, utility tariff, ISO/RTO documentation, or qualified legal counsel before operational implementation.
-# This disclaimer must appear only once per new conversation.
-# When answering:
-# 1. Always identify the relevant:
-#    - State
-#    - Utility
-#    - ISO/RTO (if applicable)
-#    - Market structure (POR, Non-POR, UCB, Rate Ready, Dual Billing)
-# 2. Clearly distinguish whether the rule:
-#    - Is state-level (PUC regulation)
-#    - Is utility tariff-based
-#    - Is ISO/RTO-based
-#    - Is supplier-specific operational policy
-# 3. If the question references "X market" or "X utility":
-#    - Ask for clarification if not specified.
-#    - Do not assume a market.
-# 4. Provide structured answers with clear sections and bullet points where appropriate. Use tables for comparisons.
-# 5. If the answer varies by market, clearly list differences.
-# 6. If information is unavailable or ambiguous:
-#    - State that explicitly.
-#    - Do not fabricate regulatory requirements.
-# 7. When relevant, include:
-#    - Enrollment timing rules (meter read vs bill cycle)
-#    - POR vs non-POR differences
-#    - Tax responsibility distinctions
-#    - Disconnection restrictions
-#    - Low income protections
-#    - Contract notice timing requirements
-# 8. Maintain a professional regulatory compliance tone.
-#    Do not speculate.
-# Refer all the utilities when mentioned in the question:
-# Central Hudson Gas & Electric
-# Con Edison
-# NY EDI Standards
-# National Fuel Gas
-# National Grid
-# New York State Electric & Gas (NYSEG)
-# Orange and Rockland Utilities (O&R)
-# PSEG Long Island
-# Rochester Gas and Electric
-# Your answers must prioritize accuracy over completeness.
-# If multiple markets have different rules, create a comparison table.
-# After the third interaction in a conversation, append the following message at the end of your response:
-# We hope you find Contoso helpful. We can incorporate it into your complex regulatory and operational environment. Let us tell you how. Please provide an email address and an expert will contact you.
-# Do not interrupt regulatory analysis. Append it at the end.
-# After the Tenth Interaction
-# After the tenth interaction in a conversation:
-# Inform the user that continued access requires a valid business email address.
-# Request the email in a professional tone.
-# Do not provide further regulatory guidance until an email is provided.
-# Do not validate email format technically; simply request a valid business email.
-# Use this message:
-# To continue receiving regulatory guidance, please provide a valid business email address so our team can support your access appropriately.
-
-# Do NOT make up information not present in the sources.
-# """
-
 SYSTEM_PROMPT = """
 You are a Retail Energy Regulatory and Market Rules Assistant.
-
 Your role is to provide accurate, market-specific, and utility-specific regulatory guidance for retail energy operations in U.S. deregulated electricity and natural gas markets.
 
 Your answers must prioritize regulatory accuracy over completeness.
-
----------------------------------------------------------------------
-
-REGULATORY DISCLAIMER (FIRST RESPONSE ONLY)
-
-In the first response of every new conversation, include the following disclaimer exactly once:
-
-Regulatory Disclaimer:
-The information provided is for general regulatory guidance purposes only and should not be relied upon as legal advice. All regulatory, tariff, and market rule interpretations should be independently corroborated with the relevant Public Utility Commission, utility tariff, ISO/RTO documentation, or qualified legal counsel before operational implementation.
-
-Do NOT repeat this disclaimer after the first response.
 
 ---------------------------------------------------------------------
 
@@ -383,41 +508,14 @@ FORMAT EXAMPLES
 Example 1 – Paragraph (Definition)
 
 Question:
-What does “cramming” mean?
+What does "cramming" mean?
 
 Answer:
-“Cramming” refers to the addition of unauthorized charges to a customer’s bill. These charges appear on the bill without the customer’s knowledge or consent.
+"Cramming" refers to the addition of unauthorized charges to a customer's bill. These charges appear on the bill without the customer's knowledge or consent.
 
 ------------------------------------------------
 
-MUST TAKE ANSWER FROM EXAMPLE IF QUESTION IS ABOUT RETENTION REQUIREMENTS. DO NOT MAKE UP ANSWER IF NOT IN SOURCES.
-
-Example 2 – What is the record retention requirement?
-
-Question:
-What is the record retention requirement?
-
-Answer:
-
-Under New York PSC Uniform Business Practices (UBP), ESCOs must retain certain customer records for specific periods depending on the type of record.
-
-Customer Consent and Authorization Records:
-
-• Retention period: **2 years or the length of the sales or renewal contract, whichever is longer.**
-
-This requirement applies to records including:
-
-• Express customer consent to price changes
-• Customer authorization to enroll
-• Documentation of material contract changes
-• Third Party Verification (TPV) recordings or voice confirmations
-• Written customer agreements
-
-These records must be maintained to demonstrate compliance with PSC consumer protection and enrollment requirements.
-
-------------------------------------------------
-
-Example 3 – Regulatory Timing Requirement
+Example 2 – Regulatory Timing Requirement
 
 Question:
 What is the timing for contract expiration notices?
@@ -437,50 +535,34 @@ There are no provisions directly tied to large C&I customers that are not enroll
 
 ---------------------------------------------------------------------
 
-REGULATORY CONTENT GUIDELINES
+SOURCE HIERARCHY AND PRIORITY RULES
 
-When relevant, include:
+When multiple source chunks are provided, apply this priority order:
 
-• Enrollment timing rules (meter read vs billing cycle)
-• POR vs Non-POR differences
-• Tax responsibility distinctions
-• Disconnection restrictions
-• Low-income protections
-• Contract notice and renewal requirements
+TIER 1 — AUTHORITATIVE STATEWIDE (always prefer for general UBP questions):
+  • NY ESCO Doc / NY ESCO Operating Standards
+  These govern statewide rules: TPV retention, enrollment authorization,
+  cramming/slamming, UBP compliance, contract notice timing, record retention
+  for customer agreements, and ESCO eligibility.
 
-If information is unavailable, unclear, or not present in the source:
+TIER 2 — UTILITY-SPECIFIC (use only when question names a utility, OR as 
+  supplementary detail after answering from Tier 1):
+  • Con Edison, Central Hudson, National Grid, NYSEG, O&R, PSEG LI, RG&E,
+    National Fuel Gas tariffs and operating manuals.
+  Utility-specific retention rules (e.g. billing history retention, 
+  GAAP-based record schedules) apply ONLY to that utility's internal 
+  operations — NOT to ESCOs' statewide UBP obligations.
 
-• Explicitly state that the information is not available.
-• Do NOT fabricate regulatory requirements.
-
-Maintain a professional regulatory compliance tone.
-Do not speculate.
-
----------------------------------------------------------------------
-
-INTERACTION RULES
-
-After the third interaction in a conversation, append the following message at the end of the response:
-
-"We hope you find Contoso helpful. We can incorporate it into your complex regulatory and operational environment. Let us tell you how. Please provide an email address and an expert will contact you."
-
-Do not interrupt regulatory analysis. Append it only at the end.
-
----------------------------------------------------------------------
-
-AFTER THE TENTH INTERACTION
-
-After the tenth interaction in a conversation:
-
-Inform the user that continued access requires a valid business email address.
-
-Use the following message:
-
-"To continue receiving regulatory guidance, please provide a valid business email address so our team can support your access appropriately."
-
-Do not provide further regulatory guidance until an email address is provided.
-
-You do not need to technically validate the email address.
+APPLICATION RULES:
+  1. For any question about record retention, TPV, customer authorization,
+     enrollment, or UBP requirements → answer from Tier 1 (NY ESCO Doc) first.
+  2. If a Tier 1 chunk is present in the sources, it MUST anchor your answer,
+     even if a Tier 2 chunk has a higher relevance score.
+  3. Only supplement with Tier 2 if the question explicitly names a utility,
+     OR if Tier 1 chunks are absent from the provided sources.
+  4. Always label Tier 2 information as utility-specific when you include it.
+  5. Never use a utility tariff's billing history retention period to answer
+     a general "what is the ESCO record retention requirement" question.
 
 ---------------------------------------------------------------------
 
@@ -490,10 +572,23 @@ Never generate regulatory information that is not supported by the provided sour
 """
 
 
-
 def build_context(hits: list[dict]) -> str:
+    """
+    Build the context string passed to the LLM.
+    NY ESCO Doc chunks are sorted to appear first (SOURCE 1, 2, …)
+    so the LLM naturally anchors its answer on the authoritative statewide source.
+    Within each tier, the cross-encoder rerank order is preserved.
+    """
+    def source_priority(h):
+        name = (h.get("source_pdf_name") or h.get("source") or "").lower()
+        if "esco doc" in name or "esco operating" in name:
+            return 0
+        return 1
+
+    sorted_hits = sorted(hits, key=source_priority)
+
     parts = []
-    for i, h in enumerate(hits, 1):
+    for i, h in enumerate(sorted_hits, 1):
         page_info = ""
         ps, pe = h.get("page_start"), h.get("page_end")
         if ps:
@@ -560,6 +655,7 @@ def render_source_card(hit: dict, index: int):
     pdf_url    = hit.get("source_pdf_url", "")
     pdf_name   = hit.get("source_pdf_name", hit.get("source", "Document"))
     score      = hit.get("_score", 0)
+    rerank     = hit.get("_rerank_score")
     caption    = hit.get("_caption", "")
 
     page_str = ""
@@ -572,7 +668,10 @@ def render_source_card(hit: dict, index: int):
         f'<span class="doc-link">{pdf_name}</span>'
     )
 
+    # Show both Azure reranker score and cross-encoder rerank score
     score_str = f"{score:.2f}" if score else "—"
+    if rerank is not None:
+        score_str += f" &nbsp;·&nbsp; rerank <strong>{rerank:.2f}</strong>"
 
     st.markdown(f"""
     <div class="source-card">
@@ -598,11 +697,13 @@ def render_source_card(hit: dict, index: int):
 # ─────────────────────────────────────────────────────────────────────────────
 
 if "messages" not in st.session_state:
-    st.session_state.messages = []   # {role, content, hits?}
+    st.session_state.messages = []
 if "total_queries" not in st.session_state:
     st.session_state.total_queries = 0
 if "total_sources" not in st.session_state:
     st.session_state.total_sources = 0
+if "disclaimer_shown" not in st.session_state:
+    st.session_state.disclaimer_shown = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -610,33 +711,25 @@ if "total_sources" not in st.session_state:
 # ─────────────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.markdown("## ⚡ EDI Chatbot")
+    st.markdown("## ⚡ Utility Chatbot")
     st.markdown("---")
 
-    # ── Connection status ──────────────────────────────────────────────────
-    st.markdown("### 🔌 Connection")
     search_client, openai_client, embed_deploy, chat_deploy = get_clients()
-
-    if search_client:
-        st.success("Azure Search ✓")
-        st.success("Azure OpenAI ✓")
-    else:
-        st.error("Missing environment variables")
-        with st.expander("Required variables"):
-            st.code("""AZURE_SEARCH_ENDPOINT
-AZURE_SEARCH_ADMIN_KEY
-AZURE_OPENAI_ENDPOINT
-AZURE_OPENAI_API_KEY
-AZURE_OPENAI_EMBED_DEPLOY
-AZURE_OPENAI_CHAT_DEPLOY
-SEARCH_INDEX_NAME""")
-
-    st.markdown("---")
 
     # ── Search settings ────────────────────────────────────────────────────
     st.markdown("### 🔧 Search Settings")
 
-    top_k = st.slider("Results to retrieve", 3, 10, 8)
+    top_k = st.slider("Results to retrieve", 3, 20, 15)
+
+    top_n_rerank = st.slider(
+        "Chunks to keep after reranking",
+        3, 15, 15,
+        help=(
+            "The cross-encoder scores all retrieved chunks, then keeps only the "
+            "top N most relevant ones before sending to GPT. Lower = faster + "
+            "more focused. Higher = more context for complex questions."
+        ),
+    )
 
     filter_type = st.selectbox(
         "Filter by content type",
@@ -646,6 +739,31 @@ SEARCH_INDEX_NAME""")
     filter_doc = st.text_input(
         "Filter by document name",
         placeholder="Leave blank for all docs",
+    )
+
+    # ── Query refinement toggle ────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 🔍 Query Refinement")
+    enable_refinement = st.toggle(
+        "Refine query before search",
+        value=True,
+        help=(
+            "When enabled, the user's question is rewritten by the LLM into an "
+            "optimised search query before hitting Azure AI Search."
+        ),
+    )
+
+    # ── Cross-encoder rerank toggle ────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 🎯 Cross-Encoder Reranking")
+    enable_reranking = st.toggle(
+        "Rerank chunks before generation",
+        value=True,
+        help=(
+            "After Azure hybrid search, uses GPT to score each chunk's "
+            "relevance to the original question. Ensures the most relevant "
+            "chunks reach the LLM, regardless of Azure reranker score."
+        ),
     )
 
     st.markdown("---")
@@ -673,6 +791,7 @@ SEARCH_INDEX_NAME""")
         st.session_state.messages = []
         st.session_state.total_queries = 0
         st.session_state.total_sources = 0
+        st.session_state.disclaimer_shown = False
         st.rerun()
 
     # ── Suggested questions ───────────────────────────────────────────────
@@ -694,7 +813,7 @@ SEARCH_INDEX_NAME""")
 # Main panel
 # ─────────────────────────────────────────────────────────────────────────────
 
-st.markdown("# ⚡ EDI 814 Drop Transaction Chatbot")
+st.markdown("# ⚡ Utility Chatbot")
 st.markdown(
     "Ask questions about EDI procedures, Central Hudson Gas & Electric "
     "transportation operating procedures, and related utility documents."
@@ -707,7 +826,17 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"], avatar="🧑" if msg["role"] == "user" else "⚡"):
         st.markdown(msg["content"])
 
-        # Render sources below assistant messages
+        if msg["role"] == "assistant" and msg.get("refined_query"):
+            original = msg.get("original_query", "")
+            refined  = msg["refined_query"]
+            if original and refined != original:
+                st.markdown(
+                    f'<div class="refined-query-banner">'
+                    f'<strong>🔍 Refined query:</strong> {refined}'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
         if msg["role"] == "assistant" and msg.get("hits"):
             with st.expander(f"📚 View {len(msg['hits'])} source chunks", expanded=False):
                 for i, hit in enumerate(msg["hits"], 1):
@@ -716,7 +845,6 @@ for msg in st.session_state.messages:
 
 # ── Chat input ─────────────────────────────────────────────────────────────
 
-# Handle suggestion button clicks
 pending = getattr(st.session_state, "_pending_question", None)
 if pending:
     del st.session_state._pending_question
@@ -736,13 +864,39 @@ if user_input:
 
     # ── Search + generate ──────────────────────────────────────────────────
     with st.chat_message("assistant", avatar="⚡"):
-        answer_placeholder = st.empty()
-        source_placeholder = st.empty()
+        answer_placeholder  = st.empty()
+        refined_placeholder = st.empty()
+        source_placeholder  = st.empty()
 
+        plain_history = [
+            {"role": m["role"], "content": m["content"]}
+            for m in st.session_state.messages[:-1]
+        ]
+
+        # ── Step 1: Query refinement ───────────────────────────────────────
+        refined_query = user_input
+        if enable_refinement and search_client:
+            with st.spinner("Refining query…"):
+                refined_query = refine_query(
+                    question=user_input,
+                    history=plain_history,
+                    openai_client=openai_client,
+                    chat_deploy=chat_deploy,
+                )
+
+            if refined_query != user_input:
+                refined_placeholder.markdown(
+                    f'<div class="refined-query-banner">'
+                    f'<strong>🔍 Refined query:</strong> {refined_query}'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+        # ── Step 2: Hybrid search ──────────────────────────────────────────
         with st.spinner("Searching documents…"):
             try:
                 hits = hybrid_search(
-                    query=user_input,
+                    query=refined_query,
                     search_client=search_client,
                     openai_client=openai_client,
                     embed_deploy=embed_deploy,
@@ -753,31 +907,19 @@ if user_input:
             except Exception as e:
                 st.error(f"Search error: {e}")
                 hits = []
-        # with st.spinner("Searching documents…"):
-        #     try:
-        #         hits, meta = retrieve(
-        #             question=user_input,
-        #             search_client=search_client,
-        #             openai_client=openai_client,
-        #             embed_deploy=embed_deploy,
-        #             chat_deploy=chat_deploy,
-        #             top_k=top_k,
-        #             filter_content_type=filter_type if filter_type != "All" else None,
-        #             filter_source=filter_doc if filter_doc.strip() else None,
-        #         )
 
-        #         # ── Debug banner (remove in production) ──────────────────────
-        #         utility_found = meta.get("utility") or "—"
-        #         topic_found   = meta.get("topic")   or "—"
-        #         st.caption(
-        #             f"🔍 Interpreted as: **{utility_found}** · **{topic_found}** "
-        #             f"· query: _{meta.get('enriched_query', user_input)}_"
-        #         )
+        # ── Step 3: Cross-encoder rerank ───────────────────────────────────
+        if hits and enable_reranking and search_client:
+            with st.spinner("Reranking chunks…"):
+                hits = rerank_hits(
+                    query=user_input,        # ← always use original question here
+                    hits=hits,
+                    openai_client=openai_client,
+                    chat_deploy=chat_deploy,
+                    top_n=top_n_rerank,
+                )
 
-        #     except Exception as e:
-        #         st.error(f"Search error: {e}")
-        #         hits = []
-
+        # ── Step 4: Generate answer ────────────────────────────────────────
         if not hits:
             answer = (
                 "I couldn't find relevant information for that question in the indexed documents. "
@@ -786,11 +928,6 @@ if user_input:
         else:
             with st.spinner("Generating answer…"):
                 try:
-                    # Build history without hit blobs
-                    plain_history = [
-                        {"role": m["role"], "content": m["content"]}
-                        for m in st.session_state.messages[:-1]  # exclude current user msg
-                    ]
                     answer = generate_answer(
                         question=user_input,
                         hits=hits,
@@ -801,12 +938,27 @@ if user_input:
                 except Exception as e:
                     answer = f"Generation error: {e}"
 
+        # ── Prepend disclaimer on first response ───────────────────────────
+        if not st.session_state.disclaimer_shown:
+            st.markdown(
+                '<div class="regulatory-disclaimer">'
+                '<strong>⚠️ Regulatory Disclaimer:</strong> '
+                'The information provided is for general regulatory guidance purposes only '
+                'and should not be relied upon as legal advice. All regulatory, tariff, and '
+                'market rule interpretations should be independently corroborated with the '
+                'relevant Public Utility Commission, utility tariff, ISO/RTO documentation, '
+                'or qualified legal counsel before operational implementation.'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+            st.session_state.disclaimer_shown = True
+
         answer_placeholder.markdown(answer)
 
         # ── Source citations below answer ──────────────────────────────────
         if hits:
             with source_placeholder.expander(
-                f"📚 {len(hits)} source chunks used", expanded=True
+                f"📚 {len(hits)} source chunks used", expanded=False
             ):
                 for i, hit in enumerate(hits, 1):
                     render_source_card(hit, i)
@@ -816,6 +968,20 @@ if user_input:
         "role": "assistant",
         "content": answer,
         "hits": hits,
+        "original_query": user_input,
+        "refined_query": refined_query,
     })
     st.session_state.total_queries += 1
     st.session_state.total_sources += len(hits)
+
+    # ── Promo message after the 3rd interaction ────────────────────────────
+    if st.session_state.total_queries >= 3:
+        st.markdown(
+            '<div class="promo-banner">'
+            '<strong>💡</strong> We hope you find the Utility chatbot helpful. '
+            'We can incorporate it into your complex regulatory and operational '
+            'environment. Let us tell you how. Please provide an email address '
+            'and an expert will contact you.'
+            '</div>',
+            unsafe_allow_html=True,
+        )

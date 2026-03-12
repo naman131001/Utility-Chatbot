@@ -1,211 +1,246 @@
-"""
-embed_and_index_chunks.py
--------------------------
-Embeds chunks from chunker.py v6 and uploads them to Azure AI Search.
+# ─────────────────────────────────────────────────────────────────────────────
+# QUERY UNDERSTANDING — replaces UTILITY_KEYWORD_MAP + TOPIC_KEYWORD_MAP
+# ─────────────────────────────────────────────────────────────────────────────
 
-Supports the full schema including:
-- region
-- energy_utility_name
-- topic/subtopic
-- section
-- metadata
-"""
-
-import os
+from pydantic import BaseModel
+from typing import Literal, Optional
 import json
-import time
-import random
-from pathlib import Path
-from dotenv import load_dotenv
 
-from openai import AzureOpenAI
-from azure.core.credentials import AzureKeyCredential
-from azure.search.documents import SearchClient
+# ── 1. Document registry — maps source_pdf_name to scope and category ────────
+# Add every document in your index here.
+# scope: "cross_utility" = applies to all utilities (UBP, EDI, NY ESCO Doc)
+#         "utility_specific" = one utility's tariff/procedure manual
 
-# ─────────────────────────────────────────────
-# Load env
-# ─────────────────────────────────────────────
+DOCUMENT_REGISTRY: dict[str, dict] = {
+    "NY ESCO Doc.pdf": {
+        "scope": "cross_utility",
+        "aliases": ["esco doc", "ny esco", "esco eligibility", "ubp", 
+                    "uniform business practices", "retail access eligibility"],
+        "utility": None,
+    },
+    "Central Hudson Gas & Electric.pdf": {
+        "scope": "utility_specific",
+        "aliases": ["central hudson", "central hud", "chge"],
+        "utility": "Central Hudson Gas & Electric",
+    },
+    "Con Edison.pdf": {
+        "scope": "utility_specific",
+        "aliases": ["con edison", "coned", "consolidated edison"],
+        "utility": "Con Edison",
+    },
+    "National Fuel Gas.pdf": {
+        "scope": "utility_specific",
+        "aliases": ["national fuel", "nfg"],
+        "utility": "National Fuel Gas",
+    },
+    "National Grid.pdf": {
+        "scope": "utility_specific",
+        "aliases": ["national grid"],
+        "utility": "National Grid",
+    },
+    "New York State Electric & Gas.pdf": {
+        "scope": "utility_specific",
+        "aliases": ["nyseg", "new york state electric", "new york state gas"],
+        "utility": "New York State Electric & Gas",
+    },
+    "Orange and Rockland Utilities.pdf": {
+        "scope": "utility_specific",
+        "aliases": ["orange and rockland", "o&r", "rockland"],
+        "utility": "Orange and Rockland Utilities",
+    },
+    "PSEG Long Island.pdf": {
+        "scope": "utility_specific",
+        "aliases": ["pseg long island", "pseg", "lipa"],
+        "utility": "PSEG Long Island",
+    },
+    "Rochester Gas and Electric.pdf": {
+        "scope": "utility_specific",
+        "aliases": ["rochester gas", "rge", "rochester"],
+        "utility": "Rochester Gas and Electric",
+    },
+    # Add your other cross-utility docs here:
+    # "NY EDI Standards.pdf": { "scope": "cross_utility", ... }
+    # "Uniform Business Practices.pdf": { "scope": "cross_utility", ... }
+}
 
-load_dotenv()
-
-AZURE_OPENAI_ENDPOINT = os.environ["AZURE_OPENAI_ENDPOINT"]
-AZURE_OPENAI_KEY = os.environ["AZURE_OPENAI_API_KEY"]
-AZURE_OPENAI_EMBED_DEPLOY = os.environ["AZURE_OPENAI_EMBED_DEPLOY"]
-
-AZURE_SEARCH_ENDPOINT = os.environ["AZURE_SEARCH_ENDPOINT"]
-AZURE_SEARCH_KEY = os.environ["AZURE_SEARCH_ADMIN_KEY"]
-SEARCH_INDEX_NAME = os.environ.get("SEARCH_INDEX_NAME", "edi-documents")
-
-# batching
-EMBED_BATCH_SIZE = 100
-UPLOAD_BATCH_SIZE = 100
-MAX_RETRIES = 6
-
-
-# ─────────────────────────────────────────────
-# Azure clients
-# ─────────────────────────────────────────────
-
-aoai_client = AzureOpenAI(
-    azure_endpoint=AZURE_OPENAI_ENDPOINT,
-    api_key=AZURE_OPENAI_KEY,
-    api_version="2024-08-01-preview",
-)
-
-search_client = SearchClient(
-    endpoint=AZURE_SEARCH_ENDPOINT,
-    index_name=SEARCH_INDEX_NAME,
-    credential=AzureKeyCredential(AZURE_SEARCH_KEY),
-)
-
-
-# ─────────────────────────────────────────────
-# Retry wrapper
-# ─────────────────────────────────────────────
-
-def retry(func):
-
-    for attempt in range(MAX_RETRIES):
-        try:
-            return func()
-
-        except Exception as e:
-
-            if "429" in str(e):
-
-                wait = (2 ** attempt) + random.random()
-
-                print(
-                    f"⚠️ Rate limited — retrying in {wait:.1f}s "
-                    f"(attempt {attempt+1})"
-                )
-
-                time.sleep(wait)
-
-            else:
-                raise
-
-    raise RuntimeError("Max retries exceeded")
+# Topics that ALWAYS live in cross-utility docs regardless of question phrasing
+CROSS_UTILITY_TOPICS = {
+    "record retention", "esco eligibility", "esco registration",
+    "retail access eligibility", "officer certification",
+    "january 31 statement", "application package",
+    "edi 814", "edi standards", "enrollment process statewide",
+    "switching rules statewide", "cramming", "slamming",
+    "consumer protection statewide",
+}
 
 
-# ─────────────────────────────────────────────
-# Load chunks
-# ─────────────────────────────────────────────
+# ── 2. Query classifier using structured output ───────────────────────────────
 
-def load_chunks(path):
+CLASSIFIER_SYSTEM_PROMPT = """
+You are a query classifier for a New York retail energy regulatory document system.
 
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+Given a user question, extract structured metadata to help route the search correctly.
+
+Your index contains two types of documents:
+1. CROSS-UTILITY documents: Apply to ALL utilities statewide.
+   Examples: NY ESCO Doc (ESCO eligibility, UBP rules, retail access, record retention, 
+   EDI standards, cramming/slamming rules, January 31 statements, officer certification)
+   
+2. UTILITY-SPECIFIC documents: Rules for ONE utility.
+   Examples: Central Hudson tariff, Con Edison procedures, National Grid operating rules,
+   NYSEG, PSEG Long Island, Orange & Rockland, Rochester Gas & Electric, National Fuel Gas
+
+Return a JSON object with these fields:
+{
+  "detected_utility": string or null,       // exact utility name if mentioned, else null
+  "detected_topic": string or null,         // short topic description, else null  
+  "document_scope": "cross_utility" | "utility_specific" | "both" | "unknown",
+  "multiple_utilities": boolean,            // true if question compares 2+ utilities
+  "is_procedural": boolean,                 // true if asking about a process/steps
+  "standalone_query": string,               // rewritten self-contained search query
+  "reasoning": string                       // one sentence why you chose this scope
+}
+
+Rules:
+- If question asks about ESCO eligibility, record retention, UBP rules, EDI standards, 
+  cramming, slamming, or January 31 filings → document_scope = "cross_utility"
+- If question explicitly names a utility → document_scope = "utility_specific"
+- If question asks to compare utilities → multiple_utilities = true, document_scope = "both"
+- If utility is unclear → document_scope = "unknown" (do NOT guess)
+- standalone_query: rewrite the question as if it has no prior conversation context.
+  Incorporate any utility/topic context from the conversation history provided.
+"""
 
 
-# ─────────────────────────────────────────────
-# Embedding generation
-# ─────────────────────────────────────────────
-
-def embed_texts(texts):
-
-    def call():
-        return aoai_client.embeddings.create(
-            model=AZURE_OPENAI_EMBED_DEPLOY,
-            input=texts,
+def classify_query(
+    question: str,
+    conversation_history: list[dict],
+    openai_client,
+    chat_deploy: str,
+) -> dict:
+    """
+    Run the LLM classifier once before search.
+    Returns structured metadata dict.
+    """
+    # Build a compact history summary (last 3 turns only)
+    history_snippet = ""
+    if conversation_history:
+        last_turns = conversation_history[-3:]
+        history_snippet = "\n".join(
+            f"{t['role'].upper()}: {t['content'][:200]}"
+            for t in last_turns
         )
 
-    response = retry(call)
+    user_prompt = f"""
+CONVERSATION HISTORY (last 3 turns):
+{history_snippet if history_snippet else "(none — first question)"}
 
-    return [d.embedding for d in response.data]
+CURRENT QUESTION:
+{question}
 
+Classify the current question.
+"""
 
-# ─────────────────────────────────────────────
-# Upload to Azure Search
-# ─────────────────────────────────────────────
-
-def upload_documents(docs):
-
-    def call():
-        return search_client.upload_documents(docs)
-
-    retry(call)
-
-
-# ─────────────────────────────────────────────
-# Convert chunk → search document
-# ─────────────────────────────────────────────
-
-def build_document(chunk, embedding):
-
-    doc = dict(chunk)
-
-    doc["content_vector"] = embedding
-
-    return doc
-
-
-# ─────────────────────────────────────────────
-# Main indexing pipeline
-# ─────────────────────────────────────────────
-
-def index_chunks(chunk_file):
-
-    chunks = load_chunks(chunk_file)
-
-    print(f"Loaded {len(chunks)} chunks")
-
-    texts = [c["content"] for c in chunks]
-
-    embeddings = []
-
-    print("Generating embeddings...")
-
-    for i in range(0, len(texts), EMBED_BATCH_SIZE):
-
-        batch = texts[i:i + EMBED_BATCH_SIZE]
-
-        batch_embeddings = embed_texts(batch)
-
-        embeddings.extend(batch_embeddings)
-
-        print(
-            f"Embedded {min(i+EMBED_BATCH_SIZE,len(texts))} "
-            f"/ {len(texts)}"
+    try:
+        response = openai_client.chat.completions.create(
+            model=chat_deploy,
+            messages=[
+                {"role": "system", "content": CLASSIFIER_SYSTEM_PROMPT},
+                {"role": "user",   "content": user_prompt},
+            ],
+            temperature=0,
+            max_tokens=300,
+            response_format={"type": "json_object"},
         )
+        result = json.loads(response.choices[0].message.content)
+        result["_raw_question"] = question
+        return result
 
-    print("Preparing Azure Search documents...")
+    except Exception as e:
+        # Graceful fallback — don't crash the whole pipeline
+        return {
+            "detected_utility": None,
+            "detected_topic": None,
+            "document_scope": "unknown",
+            "multiple_utilities": False,
+            "is_procedural": False,
+            "standalone_query": question,
+            "reasoning": f"Classifier failed: {e}",
+            "_raw_question": question,
+        }
 
-    docs = []
 
-    for chunk, emb in zip(chunks, embeddings):
+# ── 3. Smart OData filter builder using classifier output ─────────────────────
 
-        doc = build_document(chunk, emb)
+def build_smart_odata_filter(
+    classification: dict,
+    filter_content_type: Optional[str],
+    filter_source: Optional[str],   # manual sidebar override
+) -> Optional[str]:
+    """
+    Build OData filter from LLM classification output.
+    """
+    filters: list[str] = []
 
-        docs.append(doc)
+    if filter_content_type and filter_content_type != "All":
+        filters.append(f"content_type eq '{filter_content_type.lower()}'")
 
-    print("Uploading to Azure AI Search...")
+    # Manual sidebar override always wins
+    if filter_source and filter_source.strip():
+        safe = filter_source.replace("'", "''")
+        filters.append(f"source_pdf_name eq '{safe}'")
+        return " and ".join(filters) if filters else None
 
-    for i in range(0, len(docs), UPLOAD_BATCH_SIZE):
+    scope = classification.get("document_scope", "unknown")
+    utility = classification.get("detected_utility")
+    multiple = classification.get("multiple_utilities", False)
 
-        batch = docs[i:i + UPLOAD_BATCH_SIZE]
+    if multiple or scope == "both":
+        # Cross-utility comparison — no source filter, cast wide net
+        pass
 
-        upload_documents(batch)
+    elif scope == "cross_utility":
+        # Find all cross-utility docs and use an OData 'or' filter
+        cross_docs = [
+            name for name, meta in DOCUMENT_REGISTRY.items()
+            if meta["scope"] == "cross_utility"
+        ]
+        if cross_docs:
+            or_clauses = " or ".join(
+                f"source_pdf_name eq '{d.replace(chr(39), chr(39)*2)}'"
+                for d in cross_docs
+            )
+            filters.append(f"({or_clauses})")
 
-        print(
-            f"Uploaded {min(i+UPLOAD_BATCH_SIZE,len(docs))} "
-            f"/ {len(docs)}"
+    elif scope == "utility_specific" and utility:
+        # Find the exact source_pdf_name for this utility
+        matched_doc = next(
+            (name for name, meta in DOCUMENT_REGISTRY.items()
+             if meta.get("utility") == utility),
+            None
         )
+        if matched_doc:
+            safe = matched_doc.replace("'", "''")
+            filters.append(f"source_pdf_name eq '{safe}'")
 
-    print("✅ Indexing completed")
+    # scope == "unknown" → no filter, full index search
+
+    return " and ".join(filters) if filters else None
 
 
-# ─────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────
+# ── 4. Enriched query using classifier's standalone_query ─────────────────────
 
-if __name__ == "__main__":
+def build_enriched_query_v2(classification: dict) -> str:
+    """
+    Use the LLM-rewritten standalone query for embedding.
+    Prepend utility + topic as breadcrumb if available.
+    """
+    standalone = classification.get("standalone_query", classification["_raw_question"])
+    utility    = classification.get("detected_utility")
+    topic      = classification.get("detected_topic")
 
-    chunk_file = Path("chunks.json")
-
-    if not chunk_file.exists():
-        raise FileNotFoundError(
-            "chunks.json not found — run chunker first"
-        )
-
-    index_chunks(chunk_file)
+    prefix_parts = [p for p in [utility, topic] if p]
+    if prefix_parts:
+        return " | ".join(prefix_parts) + " | " + standalone
+    return standalone
+ 
