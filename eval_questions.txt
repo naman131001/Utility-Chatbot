@@ -1,0 +1,6 @@
+# Utility Chatbot — Evaluation Questions
+# One question per line. Lines starting with # are ignored.
+# These cover the main regulatory topics in your index.
+
+# ── UBP / ESCO statewide rules (should pull from NY ESCO Doc) ──
+When a REP sends an enrollment transaction to a utility, what data fields are required in the 814? 

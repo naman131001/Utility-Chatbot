@@ -25,5 +25,4 @@ openai>=1.30.0
 # For loading .env files in local development
 python-dotenv>=1.0.0
 
-
-streamlit 
+streamlit

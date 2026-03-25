@@ -1,0 +1,25 @@
+============================================================
+UTILITY CHATBOT — RAG EVALUATION SUMMARY
+Generated: 2026-03-17 12:19
+============================================================
+
+Metric                  Avg Score  Rating           What it measures
+---------------------------------------------------------------------------
+  groundedness           5.00 / 5   ✅ GOOD           Hallucination: answer backed by retrieved chunks?
+  relevance              5.00 / 5   ✅ GOOD           Answer addresses the user's actual question?
+  retrieval              5.00 / 5   ✅ GOOD           Retrieved chunks relevant to the query?
+  coherence              4.00 / 5   ✅ GOOD           Response logically structured and readable?
+
+---------------------------------------------------------------------------
+SCORE GUIDE: 5 = excellent  |  4+ = good  |  3–4 = fair  |  <3 = needs work
+
+TROUBLESHOOTING:
+  Low groundedness → model is hallucinating beyond retrieved chunks
+    Fix: tighten system prompt, lower temperature, improve reranking
+  Low relevance    → answer misses the point of the question
+    Fix: review query refinement logic, improve chunking granularity
+  Low retrieval    → wrong chunks being surfaced from Azure AI Search
+    Fix: tune semantic config, BM25 field weights, embedding model
+  Low coherence    → response is disjointed or poorly formatted
+    Fix: adjust SYSTEM_PROMPT format guidelines, raise max_tokens
+============================================================
